@@ -8,6 +8,8 @@
 #include <ngx_config.h>
 #include <ngx_core.h>
 #include <ngx_http.h>
+#include <mysql/mysql.h>
+#include <pthread.h>
 
 
 typedef struct {
@@ -101,6 +103,12 @@ typedef struct {
     ngx_str_t                      ssl_certificate_key;
     ngx_array_t                   *ssl_passwords;
 #endif
+
+    ngx_flag_t                     s3_redirect;
+    ngx_str_t                      mysql_host;
+    ngx_str_t                      mysql_db;
+    ngx_str_t                      mysql_user;
+    ngx_str_t                      mysql_password;
 } ngx_http_proxy_loc_conf_t;
 
 
@@ -112,6 +120,8 @@ typedef struct {
 
     ngx_chain_t                   *free;
     ngx_chain_t                   *busy;
+
+    ngx_str_t                      s3_host;
 
     unsigned                       head:1;
     unsigned                       internal_chunked:1;
@@ -153,6 +163,8 @@ static ngx_int_t
     ngx_http_proxy_internal_body_length_variable(ngx_http_request_t *r,
     ngx_http_variable_value_t *v, uintptr_t data);
 static ngx_int_t ngx_http_proxy_internal_chunked_variable(ngx_http_request_t *r,
+    ngx_http_variable_value_t *v, uintptr_t data);
+static ngx_int_t ngx_http_proxy_s3host_variable(ngx_http_request_t *r,
     ngx_http_variable_value_t *v, uintptr_t data);
 static ngx_int_t ngx_http_proxy_rewrite_redirect(ngx_http_request_t *r,
     ngx_table_elt_t *h, size_t prefix);
@@ -707,6 +719,41 @@ static ngx_command_t  ngx_http_proxy_commands[] = {
 
 #endif
 
+    { ngx_string("proxy_bcs3"),
+      NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_CONF_FLAG,
+      ngx_conf_set_flag_slot,
+      NGX_HTTP_LOC_CONF_OFFSET,
+      offsetof(ngx_http_proxy_loc_conf_t, s3_redirect),
+      NULL },
+
+    { ngx_string("proxy_bcs3_db_host"),
+      NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_CONF_TAKE1,
+      ngx_conf_set_str_slot,
+      NGX_HTTP_LOC_CONF_OFFSET,
+      offsetof(ngx_http_proxy_loc_conf_t, mysql_host),
+      NULL },
+
+    { ngx_string("proxy_bcs3_db_name"),
+      NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_CONF_TAKE1,
+      ngx_conf_set_str_slot,
+      NGX_HTTP_LOC_CONF_OFFSET,
+      offsetof(ngx_http_proxy_loc_conf_t, mysql_db),
+      NULL },
+
+    { ngx_string("proxy_bcs3_db_user"),
+      NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_CONF_TAKE1,
+      ngx_conf_set_str_slot,
+      NGX_HTTP_LOC_CONF_OFFSET,
+      offsetof(ngx_http_proxy_loc_conf_t, mysql_user),
+      NULL },
+
+    { ngx_string("proxy_bcs3_db_pwd"),
+      NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_CONF_TAKE1,
+      ngx_conf_set_str_slot,
+      NGX_HTTP_LOC_CONF_OFFSET,
+      offsetof(ngx_http_proxy_loc_conf_t, mysql_password),
+      NULL },
+
       ngx_null_command
 };
 
@@ -819,6 +866,9 @@ static ngx_http_variable_t  ngx_http_proxy_vars[] = {
       ngx_http_proxy_internal_chunked_variable, 0,
       NGX_HTTP_VAR_NOCACHEABLE|NGX_HTTP_VAR_NOHASH, 0 },
 
+    { ngx_string("proxy_s3host"), NULL, ngx_http_proxy_s3host_variable, 0,
+      NGX_HTTP_VAR_CHANGEABLE|NGX_HTTP_VAR_NOCACHEABLE|NGX_HTTP_VAR_NOHASH, 0 },
+
     { ngx_null_string, NULL, NULL, 0, 0, 0 }
 };
 
@@ -826,6 +876,406 @@ static ngx_http_variable_t  ngx_http_proxy_vars[] = {
 static ngx_path_init_t  ngx_http_proxy_temp_path = {
     ngx_string(NGX_HTTP_PROXY_TEMP_PATH), { 1, 2, 0 }
 };
+
+typedef struct bc_s3_bucket {
+    ngx_str_t            name;
+    ngx_str_t            host;
+    time_t               add_time;
+    struct bc_s3_bucket *next;
+} bc_s3_bucket_t;
+
+static u_char           m_init_db       = 0;
+static pthread_mutex_t  m_init_mutex    = PTHREAD_MUTEX_INITIALIZER;
+static bc_s3_bucket_t  *m_s3_bucket     = NULL;
+static pthread_rwlock_t m_bucket_rwlock = PTHREAD_RWLOCK_INITIALIZER;
+
+
+static inline u_char *ngx_strrchr(const ngx_str_t *str, u_char c) {
+    if (str->len > 0) {
+        u_char *p = str->data + str->len - 1;
+        while (p >= str->data) {
+            if (*p == c) return p;
+            p--;
+        }
+    }
+    return NULL;
+}
+
+
+static inline time_t bc_get_time_monotonic(ngx_log_t *log) {
+    struct timespec ts;
+    if (clock_gettime(CLOCK_MONOTONIC_RAW, &ts)) {
+        ngx_log_error(NGX_LOG_CRIT, log, 0, "clock_gettime CLOCK_MONOTONIC_RAW error %d", errno);
+        return (time_t) -1;
+    }
+    return (ts.tv_sec * 1000000 + ts.tv_nsec / 1000);
+}
+
+
+static ngx_int_t bc_execute_query(ngx_http_proxy_loc_conf_t *plcf, ngx_log_t *log,
+        const char *sql) {
+    ngx_int_t ret = 0;
+    char *host, *buf = NULL;
+    u_int port, ec = 0;
+
+    if (plcf->mysql_db.len < 1) {
+        ngx_log_error(NGX_LOG_CRIT, log, 0, "no config proxy_bcs3_db_name");
+        return -1;
+    }
+
+    u_char *p = ngx_strrchr(&plcf->mysql_host, ':');
+    if (p) {
+        size_t len = p - plcf->mysql_host.data;
+        host = buf = ngx_alloc(len + 1, log);
+        if (!buf)
+            return -1;
+        ngx_memcpy(host, plcf->mysql_host.data, len);
+        host[len] = '\0';
+        port = atoi((char *) p + 1);
+    } else {
+        host = (char *) plcf->mysql_host.data;
+        port = 3306;
+    }
+
+    MYSQL m;
+    mysql_init(&m);
+    if (!mysql_real_connect(&m, host, (char *) plcf->mysql_user.data,
+            (char *) plcf->mysql_password.data, (char *) plcf->mysql_db.data, port, NULL, 0)) {
+        ngx_log_error(NGX_LOG_CRIT, log, 0, "connect mysql \"%V\" error: %ud %s",
+                &plcf->mysql_host, mysql_errno(&m), mysql_error(&m));
+        ret = -1;
+        goto out;
+    }
+
+    if (mysql_query(&m, sql)) {
+        ec = mysql_errno(&m);
+        if (ec == 1050      // Table already exists
+            || ec == 1062   // Duplicate primary key
+            ) {
+            ngx_log_debug2(NGX_LOG_DEBUG_HTTP, log, 0, "mysql_query \"%s\" error: %s",
+                    sql, mysql_error(&m));
+        } else {
+            ngx_log_error(NGX_LOG_CRIT, log, 0, "mysql_query \"%s\" error: %ud %s",
+                    sql, ec, mysql_error(&m));
+        }
+        ret = -1;
+    } else {
+        ret = mysql_affected_rows(&m);
+    }
+
+out:
+    mysql_close(&m);
+    mysql_thread_end();
+    if (buf) ngx_free(buf);
+    errno = ec;
+    return ret;
+}
+
+
+static inline size_t bc_get_host_from_cache(ngx_http_request_t *r,
+        const ngx_str_t *bucket_name, char **host, u_char force) {
+    size_t len = 0;
+    bc_s3_bucket_t *el;
+    time_t curtim = bc_get_time_monotonic(r->connection->log);
+
+    pthread_rwlock_rdlock(&m_bucket_rwlock);
+    for (el = m_s3_bucket; el; el = el->next) {
+        if (el->name.len == bucket_name->len &&
+            !ngx_strncmp(el->name.data, bucket_name->data, bucket_name->len)) {
+            if (force || el->add_time + 60000000 > curtim) {
+                ngx_log_debug2(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                        "qiuyitest: got host \"%V\" of bucket \"%V\" from cache",
+                        &el->host, bucket_name);
+                len = el->host.len;
+                *host = (char *) ngx_pstrdup(r->pool, &el->host);
+            }
+            break;
+        }
+    }
+    pthread_rwlock_unlock(&m_bucket_rwlock);
+
+    return len;
+}
+
+
+static inline void bc_add_host_to_cache(ngx_http_request_t *r,
+        const ngx_str_t *bucket_name, const char *host, size_t len) {
+    bc_s3_bucket_t **h = &m_s3_bucket, *el;
+    time_t curtim = bc_get_time_monotonic(r->connection->log);
+
+    pthread_rwlock_wrlock(&m_bucket_rwlock);
+    while ((el = *h)) {
+        if (el->add_time + 60000000 <= curtim) {
+            ngx_log_debug2(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                    "qiuyitest: free cache host \"%V\" of bucket \"%V\"", &el->host,
+                    bucket_name);
+            ngx_free(el->name.data);
+            ngx_free(el->host.data);
+            *h = el->next;
+            ngx_free(el);
+        } else
+            h = &el->next;
+    }
+    el = ngx_alloc(sizeof(bc_s3_bucket_t), r->connection->log);
+    el->name.len = bucket_name->len;
+    el->name.data = ngx_alloc(bucket_name->len + 1, r->connection->log);
+    ngx_memcpy(el->name.data, bucket_name->data, bucket_name->len);
+    el->name.data[bucket_name->len] = '\0';
+
+    el->host.len = len;
+    el->host.data = ngx_alloc(len + 1, r->connection->log);
+    ngx_memcpy(el->host.data, host, len);
+    el->host.data[len] = '\0';
+
+    el->add_time = curtim;
+    el->next = m_s3_bucket;
+    m_s3_bucket = el;
+
+    ngx_log_debug2(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+            "qiuyitest: add host \"%V\" of bucket \"%V\" to cache", &el->host,
+            bucket_name);
+    pthread_rwlock_unlock(&m_bucket_rwlock);
+}
+
+
+static ngx_int_t bc_query_bucket_host(ngx_http_request_t *r,
+        ngx_http_proxy_loc_conf_t *plcf, const ngx_str_t *bucket_name,
+        ngx_flag_t is_vhost, ngx_str_t *value) {
+    ngx_int_t ret     = 0;
+    char      *host;
+    u_int      ec     = 0;
+    MYSQL     *m      = NULL;
+    MYSQL_RES *result = NULL;
+    size_t     len    = bc_get_host_from_cache(r, bucket_name, &host, 0);
+    if (len > 0) goto got;
+
+    if (!plcf)
+        plcf = ngx_http_get_module_loc_conf(r, ngx_http_proxy_module);
+
+    u_int   port;
+    u_char *p = ngx_strrchr(&plcf->mysql_host, ':');
+    if (p) {
+        len = p - plcf->mysql_host.data;
+        host = ngx_palloc(r->pool, len + 1);
+        if (!host)
+            return -1;
+        ngx_memcpy(host, plcf->mysql_host.data, len);
+        host[len] = '\0';
+        port = atoi((char *) p + 1);
+    } else {
+        host = (char *) plcf->mysql_host.data;
+        port = 3306;
+    }
+
+    m = mysql_init(NULL);
+    if (!m) {
+        ret = -1;
+        goto out;
+    }
+    if (!mysql_real_connect(m, host, (char *) plcf->mysql_user.data,
+            (char *) plcf->mysql_password.data, (char *) plcf->mysql_db.data, port, NULL, 0)) {
+        ngx_log_error(NGX_LOG_CRIT, r->connection->log, 0, "connect mysql \"%V\" error: %ud %s",
+                &plcf->mysql_host, mysql_errno(m), mysql_error(m));
+
+        len = bc_get_host_from_cache(r, bucket_name, &host, 1);
+        if (len > 0) goto got;
+
+        ret = -1;
+        goto out;
+    }
+
+    ngx_str_t ns;
+    ns.len = bucket_name->len * 2 + 1;
+    ns.data = ngx_palloc(r->pool, ns.len);
+    if (!ns.data) {
+        ret = -1;
+        goto out;
+    }
+    ns.data[0] = '\0';
+    ns.len = mysql_real_escape_string(m, (char *) ns.data, (char *) bucket_name->data,
+            bucket_name->len);
+
+    len = 41 + ns.len;
+    u_char *sql = ngx_palloc(r->pool, len);
+    if (!sql) {
+        ret = -1;
+        goto out;
+    }
+    p = ngx_snprintf(sql, len, "SELECT hosts FROM s3bucket WHERE name='%V'", &ns);
+    *p = '\0';
+
+    if (mysql_query(m, (char *) sql)) {
+        ec = mysql_errno(m);
+        ngx_log_error(NGX_LOG_CRIT, r->connection->log, 0, "mysql_query \"%s\" error: %ud %s",
+                sql, ec, mysql_error(m));
+        ret = -1;
+        goto out;
+    }
+
+    result = mysql_store_result(m);
+    if (!result) {
+        ec = mysql_errno(m);
+        ret = -1;
+        goto out;
+    }
+    MYSQL_ROW row = mysql_fetch_row(result);
+    if (row && (len = mysql_fetch_lengths(result)[0]) > 0) {
+        host = row[0];
+        bc_add_host_to_cache(r, bucket_name, host, len);
+    got:
+        value->len = len;
+        if (is_vhost) value->len += bucket_name->len + 1;
+        p = value->data = ngx_pnalloc(r->pool, value->len + 1);
+        if (p) {
+            if (is_vhost) {
+                ngx_memcpy(p, bucket_name->data, bucket_name->len);
+                p += bucket_name->len + 1;
+                p[-1] = '.';
+            }
+            ngx_memcpy(p, host, len);
+            p[len] = '\0';
+        } else
+            ret = -1;
+        goto out;
+    }
+
+    value->len = 0;
+    value->data = (u_char *) "";
+
+out:
+    if (result) mysql_free_result(result);
+    if (m) {
+        mysql_close(m);
+        mysql_thread_end();
+    }
+    errno = ec;
+    return ret;
+}
+
+
+static inline void bc_init_db(ngx_http_proxy_loc_conf_t *plcf, ngx_log_t *log) {
+    if (m_init_db & 2) return;
+    pthread_mutex_lock(&m_init_mutex);
+    if (!(m_init_db & 2)) {
+        m_init_db |= 2;
+        bc_execute_query(plcf, log, "CREATE TABLE s3bucket (name VARCHAR(255) NOT NULL PRIMARY KEY, createTime DATETIME NOT NULL, hosts TEXT NOT NULL) ENGINE=InnoDB CHARACTER SET UTF8");
+    }
+    pthread_mutex_unlock(&m_init_mutex);
+}
+
+
+static ngx_int_t bc_s3_bucket_name(ngx_http_request_t *r, ngx_str_t *name,
+        ngx_flag_t *is_vhost) {
+    ngx_str_t bn;
+    u_char *str;
+    ngx_http_core_srv_conf_t *cscf = ngx_http_get_module_srv_conf(r, ngx_http_core_module);
+
+    ngx_log_debug2(NGX_LOG_DEBUG_HTTP, r->connection->log, 0, "qiuyitest: server_name=%V, request host=%V",
+            &cscf->server_name, &r->headers_in.server);
+
+    size_t slen = cscf->server_name.len;
+    *is_vhost = 0;
+
+    if (slen > 0 && r->headers_in.server.len > slen + 1) {
+        slen = r->headers_in.server.len - slen;
+        if (*(r->headers_in.server.data + (slen - 1)) == '.'
+                && !ngx_strncasecmp(cscf->server_name.data, r->headers_in.server.data + slen, cscf->server_name.len)) {
+            bn.len = slen - 1;
+            bn.data = ngx_pnalloc(r->pool, slen);
+            if (!bn.data)
+                return NGX_HTTP_INTERNAL_SERVER_ERROR;
+            ngx_memcpy(bn.data, r->headers_in.server.data, bn.len);
+            bn.data[bn.len] = '\0';
+            *name = bn;
+            *is_vhost = 1;
+            return NGX_OK;
+        }
+    }
+
+    if (r->uri.len > 1 && r->uri.data[0] == '/') {
+        str = ngx_strlchr(r->uri.data + 1, r->uri.data + r->uri.len, '/');
+        if (str && str > r->uri.data + 1)
+            bn.len = str - r->uri.data - 1;
+        else
+            bn.len = r->uri.len - 1;
+        bn.data = ngx_pnalloc(r->pool, bn.len + 1);
+        if (!bn.data)
+            return NGX_HTTP_INTERNAL_SERVER_ERROR;
+        ngx_memcpy(bn.data, r->uri.data + 1, bn.len);
+        bn.data[bn.len] = '\0';
+        *name = bn;
+        return NGX_OK;
+    }
+
+    bn.len = 0;
+    bn.data = (u_char *) "";
+    *name = bn;
+    return NGX_OK;
+}
+
+
+static ngx_int_t ngx_http_proxy_s3host_variable(ngx_http_request_t *r,
+    ngx_http_variable_value_t *v, uintptr_t data)
+{
+    ngx_http_proxy_ctx_t *ctx = ngx_http_get_module_ctx(r, ngx_http_proxy_module);
+    if (!ctx || ctx->s3_host.len < 1) {
+        v->not_found = 1;
+        ngx_log_error(NGX_LOG_ERR, r->connection->log, 0, "cannot set proxy_s3host variable");
+        return NGX_OK;
+    }
+
+    v->valid = 1;
+    v->no_cacheable = 0;
+    v->not_found = 0;
+    v->data = ctx->s3_host.data;
+    v->len = ctx->s3_host.len;
+
+    return NGX_OK;
+}
+
+
+static ngx_int_t bc_s3_set_proxy_host(ngx_http_request_t *r, ngx_http_proxy_loc_conf_t *plcf,
+        ngx_http_proxy_ctx_t *ctx) {
+    if (!plcf->s3_redirect) return NGX_OK;
+
+    if (!(m_init_db & 1)) {
+        pthread_mutex_lock(&m_init_mutex);
+        if (!(m_init_db & 1)) {
+            m_init_db |= 1;
+            if (mysql_library_init(0, NULL, NULL)) {
+                ngx_log_error(NGX_LOG_CRIT, r->connection->log, 0, "could not initialize mysql library");
+                pthread_mutex_unlock(&m_init_mutex);
+                return NGX_HTTP_INTERNAL_SERVER_ERROR;
+            }
+        }
+        pthread_mutex_unlock(&m_init_mutex);
+    }
+    bc_init_db(plcf, r->connection->log);
+
+    ngx_str_t bucket;
+    ngx_str_t host = ngx_null_string;
+    ngx_flag_t is_vhost;
+
+    ngx_int_t rc = bc_s3_bucket_name(r, &bucket, &is_vhost);
+    if (rc != NGX_OK) return rc;
+    ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0, "qiuyitest: bucket_name=%V", &bucket);
+
+    if (bucket.len < 1) {
+        ngx_log_error(NGX_LOG_ERR, r->connection->log, 0, "no s3 bucket name in hostname or url");
+        return NGX_HTTP_INTERNAL_SERVER_ERROR;
+    }
+
+    if (bc_query_bucket_host(r, plcf, &bucket, is_vhost, &host) < 0) {
+        ngx_log_error(NGX_LOG_ERR, r->connection->log, 0, "cannot query hostname of s3 bucket \"%V\"",
+                &bucket);
+        return NGX_HTTP_INTERNAL_SERVER_ERROR;
+    }
+    ngx_log_debug1(NGX_LOG_DEBUG_HTTP, r->connection->log, 0, "qiuyitest: bucket_host=%V", &host);
+    if (host.len < 1) return NGX_HTTP_INTERNAL_SERVER_ERROR;
+
+    ctx->s3_host = host;
+    return NGX_OK;
+}
 
 
 static ngx_int_t
@@ -851,6 +1301,8 @@ ngx_http_proxy_handler(ngx_http_request_t *r)
     ngx_http_set_ctx(r, ctx, ngx_http_proxy_module);
 
     plcf = ngx_http_get_module_loc_conf(r, ngx_http_proxy_module);
+    rc = bc_s3_set_proxy_host(r, plcf, ctx);
+    if (rc != NGX_OK) return rc;
 
     u = r->upstream;
 
@@ -2890,6 +3342,8 @@ ngx_http_proxy_create_loc_conf(ngx_conf_t *cf)
     conf->headers_hash_max_size = NGX_CONF_UNSET_UINT;
     conf->headers_hash_bucket_size = NGX_CONF_UNSET_UINT;
 
+    conf->s3_redirect = NGX_CONF_UNSET;
+
     ngx_str_set(&conf->upstream.module, "proxy");
 
     return conf;
@@ -3371,6 +3825,12 @@ ngx_http_proxy_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child)
     }
 
 #endif
+
+    ngx_conf_merge_value(conf->s3_redirect, prev->s3_redirect, 0);
+    ngx_conf_merge_str_value(conf->mysql_host, prev->mysql_host, "127.0.0.1");
+    ngx_conf_merge_str_value(conf->mysql_db, prev->mysql_db, "");
+    ngx_conf_merge_str_value(conf->mysql_user, prev->mysql_user, "root");
+    ngx_conf_merge_str_value(conf->mysql_password, prev->mysql_password, "");
 
     return NGX_CONF_OK;
 }
